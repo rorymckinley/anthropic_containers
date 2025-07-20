@@ -1,0 +1,29 @@
+services:
+  dnsmasq:
+    build: ./dnsmasq
+    container_name: dnsmasq
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "1000:1000"
+    tmpfs:
+      - /tmp
+    networks:
+      anthropic_containers:
+        ipv4_address: 172.100.0.53
+  squid-proxy:
+    build: ./proxy
+    container_name: squid-proxy
+    networks:
+      anthropic_containers:
+        ipv4_address: 172.100.0.80
+
+networks:
+  anthropic_containers:
+    name: anthropic_containers
+    ipam:
+      config:
+        # docker network inspect $(docker network ls -q) | grep Subnet
+        - subnet: 172.100.0.0/16

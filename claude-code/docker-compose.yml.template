@@ -1,0 +1,39 @@
+services:
+  claude_code_change_me:
+    image: claude-code-rory
+    container_name: claude-code-change-me
+    entrypoint: /bin/bash
+    stdin_open: true
+    tty: true
+    read_only: true
+    user: "1000:1000"
+    dns:
+      - 172.100.0.53
+    environment:
+      DISABLE_ERROR_REPORTING: "1"
+      DISABLE_TELEMETRY: "1"
+      HTTP_PROXY: http://172.100.0.80:3128
+      HTTPS_PROXY: http://172.100.0.80:3128
+    volumes:
+      - ~/data/git/change-me:/workspace/code:ro,Z
+      - claude_history:/home/claude/.claude-code:rw
+      - claude_node_home:/home/node
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      anthropic_containers:
+        # Pick a suitable IP address
+        # ipv4_address: 172.100.0.2
+    tmpfs:
+      - /tmp
+      - /run
+
+volumes:
+  claude_node_home:
+  claude_history:
+
+networks:
+  anthropic_containers:
+    external: true

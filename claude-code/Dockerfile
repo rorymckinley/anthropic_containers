@@ -1,4 +1,4 @@
-FROM node:20
+FROM node:22
 
 ARG TZ
 ENV TZ="$TZ"
@@ -14,6 +14,7 @@ RUN apt update && apt install -y less \
   unzip \
   gnupg2 \
   gh \
+  git \
   iptables \
   ipset \
   iproute2 \

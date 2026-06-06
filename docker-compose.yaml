@@ -16,6 +16,9 @@ services:
   squid-proxy:
     build: ./proxy
     container_name: squid-proxy
+    tmpfs:
+      - /tmp
+      - /run
     networks:
       anthropic_containers:
         ipv4_address: 172.100.0.80

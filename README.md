@@ -185,6 +185,47 @@ straight through? Two reasons:
 No disk quota is enforced on the outbox volume -- treat it as scratch
 space and clear it out periodically.
 
+### Reviewing what comes out
+
+Everything in the outbox was written by a process you are deliberately
+treating as potentially compromised. The review step is the control, so
+it has to be a real read, not a skim. Use `scripts/outbox.sh` from the
+host; it wraps `docker cp` with the checks below built in.
+
+```bash
+scripts/outbox.sh <container> list                                   # what's there, with types
+scripts/outbox.sh <container> diff  claude-code/Dockerfile  claude-code/Dockerfile
+scripts/outbox.sh <container> pull  claude-code/Dockerfile  claude-code/Dockerfile
+git diff                                                             # then review in the repo
+```
+
+What the script enforces, and why, if you ever bypass it:
+
+- **One regular file at a time.** It refuses symlinks and directories.
+  A planted symlink `outbox/notes.md -> ~/.claude/.credentials.json`
+  copied with `docker cp -L` would pull the credential file out under an
+  innocent name; without `-L` a dangling symlink lands in your repo
+  instead. Directories hide dotfiles and symlinks you didn't list.
+  Never pass `-L` to `docker cp`.
+- **Names are shown through `cat -v`.** A file name can carry terminal
+  escape sequences that make `ls` output lie about what's there.
+- **Exec bit cleared on pull.** `docker cp` preserves mode bits; a
+  pulled script shouldn't be runnable before it has been read.
+- **Warnings on files that execute when touched.** `.envrc` (direnv runs
+  it on `cd`), anything under `.git/hooks/`, editor task files, Makefiles
+  and friends, `package.json` scripts, pre-commit config. Read these
+  before the tool that runs them gets a chance to.
+- **Warnings on files that define the sandbox.** Compose files,
+  Dockerfiles, `squid.conf`, `dnsmasq.conf`, the managed settings. When
+  the project being worked on is *this repo*, a compromised session's
+  most valuable move is a plausible-looking "fix" that adds a `cap_add`,
+  a read-write mount of your home, an `egress` attachment on the claude
+  service, or a wider proxy ACL -- and it takes effect on the next
+  recreate. Diff these line by line, and be suspicious of any change you
+  didn't ask for.
+- **Overwrite shows the diff and asks.** So a pull onto an existing file
+  is never blind.
+
 ## Postgres
 
 Ephemeral by design: `/var/lib/postgresql/data` is `tmpfs`, so data resets
@@ -347,7 +388,16 @@ restart.
 - [ ] No write access to the code mount from inside the container.
 - [ ] A file added to the host repo after container start is visible
       inside the container without any manual relabel/chmod step.
-- [ ] A file written to the outbox volume comes out cleanly via `docker cp`.
+- [ ] A file written to the outbox volume comes out cleanly via
+      `scripts/outbox.sh <container> pull <file> <dest>`.
+- [ ] The helper refuses a symlink. Inside the container:
+      `ln -s /home/node/.claude/.credentials.json /workspace/outbox/notes.md`;
+      on the host, `scripts/outbox.sh <container> list` shows it as type
+      `l`, and `pull notes.md /tmp/notes.md` exits with "refusing".
+      Remove the symlink afterwards.
+- [ ] The helper warns on a sandbox-defining path: pull any outbox file to
+      `/tmp/docker-compose.claude.yml` and confirm the DEFINES THE SANDBOX
+      warning appears.
 - [ ] Network egress is proxy-only. From a shell inside the claude
       container, all of these must *fail* with "network unreachable" or a
       timeout:

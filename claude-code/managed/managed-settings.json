@@ -1,0 +1,9 @@
+{
+  "allowManagedHooksOnly": true,
+  "enableArtifact": false,
+  "permissions": {
+    "deny": [
+      "Artifact"
+    ]
+  }
+}

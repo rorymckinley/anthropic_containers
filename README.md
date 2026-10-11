@@ -140,9 +140,12 @@ Docker-assigned; nothing addresses anything on it by IP.
    names and the host repo path in the code mount.
 3. Fill in `.env.claude`: `PROJECT_NET_OCTET` (must be unique among
    projects running at the same time -- start at 0 and increment per
-   additional project), Postgres credentials/version, and the path to
-   your personal CLAUDE.md. Never commit this file.
-4. `docker compose --env-file .env.claude -f docker-compose.claude.yml up -d`
+   additional project), Postgres credentials/version, the path to your
+   personal CLAUDE.md, and `CLAUDE_MANAGED_DIR`. Never commit this file.
+4. Once per machine: copy `claude-code/managed/` from this repo to the
+   directory named by `CLAUDE_MANAGED_DIR` (every project can point at the
+   same one). See "Managed settings" below for what's in it.
+5. `docker compose --env-file .env.claude -f docker-compose.claude.yml up -d`
 
 ## Outbox: pull model, not push
 
@@ -242,14 +245,84 @@ docker exec claude-code-<project> curl -sS -m 10 -I https://www.anthropic.com/  
 docker exec claude-code-<project> curl -sS -m 10 -I http://api.anthropic.com/    # 403 from squid (plain HTTP refused)
 ```
 
+## Managed settings: what a session can't change
+
+The `claude_node_home` volume persists across container recreates, and it
+holds Claude Code's user-level state: `~/.claude/settings.json` and
+`~/.claude.json`. A prompt-injected session can write to both, and two
+things it could plant there would run in every later session of the same
+project *without a prompt*: hooks (shell commands fired on session start
+or around tool calls) and MCP servers (arbitrary processes started at
+launch). That turns one bad session into a persistent one.
+
+Rather than making those files read-only (which breaks Claude Code's own
+writes to them), the sandbox mounts a host-controlled directory read-only
+at `/etc/claude-code`, which is Claude Code's **managed settings** tier --
+the one above user, project, and command-line settings, intended for
+administrators. Two files live there, both from `claude-code/managed/`:
+
+- `managed-settings.json` sets `allowManagedHooksOnly: true`. Claude Code
+  then runs only hooks defined in managed settings; hooks from user,
+  project, local, plugin, and agent-frontmatter sources are blocked. A
+  session can still *write* a hook into `~/.claude/settings.json` -- it
+  just never executes. (Side effects: the `/goal` command, custom status
+  lines, and plugins with a `command` source are disabled too.) It also
+  turns off the built-in `Artifact` tool, which publishes pages to
+  claude.ai -- a write channel out of the sandbox that bypasses the
+  outbox and that the network layer can't see. Two keys do this, belt and
+  braces: `enableArtifact: false` removes the tool from the session
+  entirely (and per the docs no other settings file can turn it back on),
+  and a managed permission `deny` on `Artifact` blocks it if it's ever
+  present anyway. Managed deny rules can't be overridden by anything a
+  session writes.
+- `managed-mcp.json` with an empty `mcpServers` object. Deploying this
+  file gives it *exclusive* control: Claude Code loads only the servers it
+  lists, so a server registered in `~/.claude.json`, in a project
+  `.mcp.json`, via a plugin, or with `--mcp-config` is ignored. It also
+  suppresses the claude.ai connectors (Gmail, Drive, Calendar, etc.) --
+  deliberately, see Residual risk.
+
+What this does and doesn't cover:
+
+- Covered: hook and MCP persistence, the two no-prompt execution paths.
+- Not covered: `~/.bashrc` and the shims in the RVM/asdf/mise volumes are
+  still writable and still run when *you* open a shell or when Claude runs
+  a tool through them. That's the ordinary "compromised dev environment"
+  risk, contained to this project's sandbox; it doesn't reach the host.
+- Optional extras you can add to `managed-settings.json`:
+  `"allowManagedPermissionRulesOnly": true` makes managed settings the
+  only source of permission rules (and stops always-allow choices being
+  saved); `"permissions": {"disableBypassPermissionsMode": "disable"}`
+  rejects `--dangerously-skip-permissions`. Neither is set by default
+  because both change how you work in the sandbox, not just what a
+  compromised session can do.
+
+To change the policy: edit the files in `CLAUDE_MANAGED_DIR` on the host.
+It's a directory mount, so the container sees the edit immediately
+regardless of how your editor saves, and Claude Code reloads managed
+files when they change -- no container restart, and usually no session
+restart.
+
 ## Residual risk
 
 - The outbox is the deliberate, reviewed exfiltration path -- its value is
   that nothing leaves without your `docker cp`, not that it's leak-proof.
 - Per-tool volumes (home/RVM/asdf/mise) persist across recreates of that
   *project's* container only -- no cross-project sharing, but a
-  compromised session could still plant something in a dotfile/shim that
-  survives to the next session of the same project.
+  compromised session could still plant something in `.bashrc` or a
+  shim that survives to the next session of the same project. Hooks and
+  MCP servers, the two no-prompt vectors, are closed by the managed
+  settings tier above.
+- claude.ai connectors are an egress path the network layer can't see.
+  Gmail drafts, Drive uploads and the like go from Claude Code to
+  Anthropic over the sanctioned proxy path and from Anthropic to Google --
+  a prompt-injected session could exfiltrate through them without ever
+  leaving the allowlist. `managed-mcp.json` suppresses them in the
+  sandbox. If you want one back, list it explicitly there rather than
+  re-enabling all of them. The built-in `Artifact` tool is the same kind
+  of channel (pages published to claude.ai, private by default but
+  shareable) and isn't an MCP server, so it's denied separately via a
+  managed permission rule.
 - The one allowed egress destination is a multi-tenant service. A
   compromised session that has obtained *someone else's* Anthropic API
   key can send data to `api.anthropic.com` under that key, and the
@@ -296,6 +369,49 @@ docker exec claude-code-<project> curl -sS -m 10 -I http://api.anthropic.com/   
 - [ ] The claude service is attached to `anthropic_containers` only
       (`docker inspect <claude container> --format '{{json .NetworkSettings.Networks}}'`
       lists exactly one network).
+- [ ] Managed settings are mounted and read-only: inside the container,
+      `cat /etc/claude-code/managed-settings.json` shows the policy and
+      `touch /etc/claude-code/x` fails with "Read-only file system".
+- [ ] A hook planted in user settings does not run. Inside the container,
+      with `~/.claude/settings.json` backed up first:
+
+      ```bash
+      cp ~/.claude/settings.json /tmp/settings.bak 2>/dev/null
+      cat > ~/.claude/settings.json <<'EOF'
+      {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"touch /tmp/HOOK-RAN"}]}]}}
+      EOF
+      rm -f /tmp/HOOK-RAN; claude -p 'say ok'; ls /tmp/HOOK-RAN   # expect: No such file
+      ```
+
+      Then prove the test is live: on the host, temporarily set
+      `allowManagedHooksOnly` to `false`, rerun the last line, and expect
+      the file to appear. Set it back to `true`, rerun, expect absent
+      again -- that also proves the managed file reloads without a
+      restart. Finally restore the backup.
+- [ ] An MCP server planted in user config does not start. Inside the
+      container:
+
+      ```bash
+      rm -f /tmp/MCP-RAN
+      claude mcp add --scope user planted -- /bin/sh -c 'touch /tmp/MCP-RAN; sleep 600'
+      claude -p 'say ok'; ls /tmp/MCP-RAN   # expect: No such file
+      claude mcp list                        # expect: no "planted" entry, or an error that MCP is managed
+      claude mcp remove --scope user planted 2>/dev/null
+      ```
+
+      Either `mcp add` is refused outright or the server is registered
+      but never started; both pass.
+- [ ] No claude.ai connectors in the sandbox: `/mcp` inside a session
+      lists none (Gmail, Drive, Calendar, Claude Docs should all be
+      absent).
+- [ ] The Artifact tool is denied. Inside a session, ask: "Publish a
+      one-line HTML page as an artifact." Expect Claude to report that
+      the tool is blocked by a permission rule, with no prompt offering to
+      allow it and no URL produced. Confirm the rule is the managed one
+      and not overridable: inside the container, write
+      `{"permissions":{"allow":["Artifact"]}}` to `~/.claude/settings.json`
+      (backing it up first), repeat the request, expect the same refusal,
+      then restore the backup.
 - [ ] Postgres version is actually controlled by `POSTGRES_VERSION`.
 - [ ] Both the project `CLAUDE.md` and the personal `CLAUDE.md` take
       effect simultaneously (merge confirmed).

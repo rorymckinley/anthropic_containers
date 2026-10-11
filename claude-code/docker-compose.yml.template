@@ -64,6 +64,12 @@ services:
       - ~/data/git/change-me:/workspace/code:ro
       # Personal, cross-project CLAUDE.md -- host path supplied per machine.
       - ${PERSONAL_CLAUDE_MD_PATH}:/home/node/.claude/CLAUDE.md:ro
+      # Managed settings tier (managed-settings.json + managed-mcp.json).
+      # Read-only, host-controlled, and above everything a session can
+      # write: hooks and MCP servers planted in ~/.claude/settings.json or
+      # ~/.claude.json are ignored. Directory mount, not file mounts, so
+      # host-side edits (even rename-saving editors) are seen immediately.
+      - ${CLAUDE_MANAGED_DIR}:/etc/claude-code:ro
       - claude_node_home:/home/node
       - claude_rvm:/home/node/.rvm
       - claude_asdf:/home/node/.asdf

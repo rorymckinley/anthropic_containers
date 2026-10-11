@@ -1,32 +1,19 @@
+# Build-only. dnsmasq and squid-proxy are no longer run from here as a
+# shared stack -- each project's docker-compose.claude.yml runs its own
+# pair, on its own network. This file just builds and tags the two images
+# they're both built from:
+#
+#   docker compose -f docker-compose.yaml build
+#
+# Re-run after editing dnsmasq/dnsmasq.conf or proxy/squid.conf, then
+# recreate any running project containers to pick up the change (rebuild,
+# don't live-patch -- same as everything else in this repo).
+
 services:
   dnsmasq:
     build: ./dnsmasq
-    container_name: dnsmasq
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    user: "1000:1000"
-    tmpfs:
-      - /tmp
-    networks:
-      anthropic_containers:
-        ipv4_address: 172.100.0.53
+    image: claude-sandbox-dnsmasq
+
   squid-proxy:
     build: ./proxy
-    container_name: squid-proxy
-    tmpfs:
-      - /tmp
-      - /run
-    networks:
-      anthropic_containers:
-        ipv4_address: 172.100.0.80
-
-networks:
-  anthropic_containers:
-    name: anthropic_containers
-    ipam:
-      config:
-        # docker network inspect $(docker network ls -q) | grep Subnet
-        - subnet: 172.100.0.0/16
+    image: claude-sandbox-squid

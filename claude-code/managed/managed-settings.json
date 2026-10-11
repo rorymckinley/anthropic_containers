@@ -1,7 +1,9 @@
 {
   "allowManagedHooksOnly": true,
+  "allowManagedPermissionRulesOnly": true,
   "enableArtifact": false,
   "permissions": {
+    "allow": [],
     "deny": [
       "Artifact"
     ]

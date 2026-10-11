@@ -289,13 +289,22 @@ What this does and doesn't cover:
   still writable and still run when *you* open a shell or when Claude runs
   a tool through them. That's the ordinary "compromised dev environment"
   risk, contained to this project's sandbox; it doesn't reach the host.
-- Optional extras you can add to `managed-settings.json`:
-  `"allowManagedPermissionRulesOnly": true` makes managed settings the
-  only source of permission rules (and stops always-allow choices being
-  saved); `"permissions": {"disableBypassPermissionsMode": "disable"}`
-  rejects `--dangerously-skip-permissions`. Neither is set by default
-  because both change how you work in the sandbox, not just what a
-  compromised session can do.
+- Also covered: permission rules. `allowManagedPermissionRulesOnly: true`
+  makes the managed file the *only* source of `allow`/`ask`/`deny` rules.
+  Without it, a compromised session could write `"allow": ["Bash(*)"]`
+  into `~/.claude/settings.json` and every later session would stop
+  prompting -- the same persistence shape as hooks. (If you always run the
+  sandbox in bypass mode this costs and gains nothing for `allow` rules;
+  `deny` rules apply in every mode regardless.) The costs: always-allow
+  choices in prompts disappear and aren't saved, `--allowedTools` is
+  ignored, and the project's own `.claude/settings.json` rules are ignored
+  too -- even though that file is read-only here and so trustworthy. Any
+  baseline `allow` rules you want in every sandbox go in the managed
+  file's `permissions.allow` list (empty by default).
+- Optional extra: `"permissions": {"disableBypassPermissionsMode":
+  "disable"}` rejects `--dangerously-skip-permissions`. Not set by
+  default, since running the sandbox in bypass mode is a legitimate way
+  to use it.
 
 To change the policy: edit the files in `CLAUDE_MANAGED_DIR` on the host.
 It's a directory mount, so the container sees the edit immediately
@@ -404,6 +413,14 @@ restart.
 - [ ] No claude.ai connectors in the sandbox: `/mcp` inside a session
       lists none (Gmail, Drive, Calendar, Claude Docs should all be
       absent).
+- [ ] A permission rule planted in user settings is ignored. Run this one
+      in the default permission mode, not bypass. Inside the container,
+      with `~/.claude/settings.json` backed up first, write
+      `{"permissions":{"allow":["Bash(touch /tmp/ALLOW-TEST)"]}}` to it,
+      start `claude` interactively and ask it to run exactly
+      `touch /tmp/ALLOW-TEST`. Expect a permission prompt (the planted
+      rule did nothing) with no "always allow" option offered. Restore the
+      backup.
 - [ ] The Artifact tool is denied. Inside a session, ask: "Publish a
       one-line HTML page as an artifact." Expect Claude to report that
       the tool is blocked by a permission rule, with no prompt offering to

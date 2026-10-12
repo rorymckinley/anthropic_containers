@@ -83,6 +83,12 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+      # Pin this container's SELinux MCS level instead of taking Docker's
+      # random per-start categories, so the host-side file-context rule
+      # for this repo can name the same level and the code mount keeps
+      # per-container isolation without `:Z` -- see README, "SELinux".
+      # Derived from PROJECT_NET_OCTET so it's unique per project for free.
+      - "label=level:s0:c${PROJECT_NET_OCTET},c1000"
     # anthropic_containers ONLY. Never attach this service to `egress` --
     # that would hand the sandbox a direct route out, bypassing squid.
     networks:

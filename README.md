@@ -8,24 +8,64 @@ root fs.
 
 ## One-time host setup
 
-### SELinux (required once per machine)
+### SELinux (once per host, then one rule per sandboxed repo)
 
-Docker's `:Z` mount flag only relabels a bind mount's contents at the
-moment the container *starts* -- a file added to the host directory while
-the container keeps running isn't covered, and SELinux denies the
-container access to it until something re-triggers a relabel. Fix this
-once per host with a persistent file-context rule instead of relying on
-`:Z`:
+The code mount is plain `:ro` with no `:Z`. Three reasons not to use `:Z`:
+
+- It relabels the tree only when the container *starts*. A file that
+  lands in the repo with the wrong label while the container is running
+  stays invisible to it until a restart.
+- It assigns the container random MCS categories each start, so there is
+  no stable level a persistent host rule could match.
+- Any host-wide relabel (`restorecon`, `fixfiles`, some package updates)
+  resets the tree to its default type and the running container loses
+  access to all of it.
+
+Instead, the claude container's level is **pinned per project** in the
+compose file (`label=level:s0:c<PROJECT_NET_OCTET>,c1000`, derived from
+the same octet as the subnet), and the repo gets a **persistent
+file-context rule carrying that same level**:
 
 ```bash
-sudo dnf install -y policycoreutils-python-utils     # provides semanage
-sudo semanage fcontext -a -t container_file_t "<parent dir of your repos>(/.*)?"
-sudo restorecon -R -v "<parent dir of your repos>"
+sudo dnf install -y policycoreutils-python-utils     # provides semanage -- once per host
+
+N=<PROJECT_NET_OCTET from this project's .env.claude>
+REPO=/absolute/path/to/repo                          # exactly the code-mount source, no trailing slash
+sudo semanage fcontext -a -t container_file_t -r "s0:c${N},c1000" "${REPO}(/.*)?"
+sudo restorecon -R -v "$REPO"
 ```
 
-This has to be re-applied if that parent directory path ever changes.
-The compose files in this template deliberately use plain `:ro` (no `:Z`)
-on the code mount, relying on this host-side rule instead.
+One rule per repo you mount -- **not** the parent directory of all your
+repos. A rule on the parent would make every repo under it, sandboxed or
+not, container-accessible, and a rule with no level would make them
+readable by *any* container on the host at the SELinux layer. With the
+level pinned, only the one container carrying `s0:c<N>,c1000` can read
+this tree; every other container gets random categories that don't match.
+To see or remove rules:
+
+```bash
+sudo semanage fcontext -l | grep container_file_t
+sudo semanage fcontext -d "${REPO}(/.*)?" && sudo restorecon -R -v "$REPO"
+```
+
+Be precise about what this fixes, because it's easy to over-read:
+
+- A file created *in place* in the repo inherits `container_file_t` from
+  its directory under either scheme. The rule doesn't change inheritance;
+  `:Z` already got this case right.
+- A file that *arrives with the wrong type* -- an editor that writes to a
+  temp directory and renames into place, a `mv` from elsewhere, a
+  `git clone` into the tree from a different context -- is invisible to
+  the container under either scheme. Under `:Z` the only fix is a
+  container restart. With the rule, it's `sudo restorecon -R "$REPO"` (or
+  just the one file), no restart, and the labels survive.
+- A file you create on the host gets its *level* from your shell: `s0`,
+  no categories, which every container can read. So MCS isolation covers
+  the existing tree and anything `restorecon` has touched, not the file
+  you made a moment ago. That was equally true under `:Z`.
+
+If a file is missing inside the container: `ls -Z <file>` on the host.
+If it isn't `container_file_t`, `restorecon` it.
 
 ## Networking
 
@@ -145,7 +185,10 @@ Docker-assigned; nothing addresses anything on it by IP.
 4. Once per machine: copy `claude-code/managed/` from this repo to the
    directory named by `CLAUDE_MANAGED_DIR` (every project can point at the
    same one). See "Managed settings" below for what's in it.
-5. `docker compose --env-file .env.claude -f docker-compose.claude.yml up -d`
+5. Add the SELinux file-context rule for this repo, using this project's
+   `PROJECT_NET_OCTET` -- the `semanage`/`restorecon` pair under "SELinux"
+   above. Without it the container can't read the code mount at all.
+6. `docker compose --env-file .env.claude -f docker-compose.claude.yml up -d`
 
 ## Outbox: pull model, not push
 
@@ -386,8 +429,25 @@ restart.
 ## Verification checklist
 
 - [ ] No write access to the code mount from inside the container.
-- [ ] A file added to the host repo after container start is visible
-      inside the container without any manual relabel/chmod step.
+- [ ] The container runs at the pinned level:
+      `docker inspect <claude container> --format '{{.ProcessLabel}}'`
+      ends in `s0:c<N>,c1000`, and on the host `ls -Z <repo>/README.md`
+      shows `container_file_t:s0:c<N>,c1000`.
+- [ ] A file created in place on the host after container start is
+      visible inside the container immediately: `touch <repo>/new.txt` on
+      the host, `cat /workspace/code/new.txt` in the container.
+- [ ] A file moved in from elsewhere is *not* visible until relabelled,
+      and relabelling works without a restart: on the host
+      `touch /tmp/moved.txt && mv /tmp/moved.txt <repo>/`; in the
+      container `cat /workspace/code/moved.txt` fails with permission
+      denied; on the host `sudo restorecon -v <repo>/moved.txt`; the
+      `cat` now succeeds. (Then check which pattern your editor uses by
+      saving a new file from it and repeating the `cat`.)
+- [ ] Another container cannot read the tree:
+      `docker run --rm -v <repo>:/x:ro alpine cat /x/README.md` fails with
+      permission denied. Then prove the test is live:
+      `docker run --rm --security-opt label=level:s0:c<N>,c1000 -v <repo>:/x:ro alpine cat /x/README.md`
+      succeeds.
 - [ ] A file written to the outbox volume comes out cleanly via
       `scripts/outbox.sh <container> pull <file> <dest>`.
 - [ ] The helper refuses a symlink. Inside the container:

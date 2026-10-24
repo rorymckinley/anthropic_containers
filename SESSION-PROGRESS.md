@@ -105,3 +105,53 @@ done
 - Proxy probe results (current ACL): api/console.anthropic.com,
   platform.claude.com, claude.ai, www.anthropic.com all allowed by the
   pinned IP; statsig.anthropic.com denied.
+
+## Update 2026-10-23 -- toolchain baked into the image
+
+Findings 1-5 confirmed pulled and committed (staging == repo for all of
+them). Container still on the old compose; `docker-compose.claude.yml.keep`
+in the repo was the new instance file, now superseded by the staged one.
+
+Decisions this session:
+- Finding 6 (resource limits): deferred by Rory.
+- Finding 7: Rory dropped sudo/iptables/ipset/aggregate on the host. The
+  rest (pinning) is folded into the toolchain change below.
+- Code mount stays `:ro`. Dependency changes are made on the host
+  (lockfile updated there), then the install is repeated in the sandbox.
+- Package registries allowed through squid by hostname (index.rubygems.org,
+  rubygems.org, repo.hex.pm, registry.npmjs.org). GitHub stays closed.
+- Language runtimes are built into the image from .env.claude build args
+  (RVM for Ruby; asdf for Erlang/Elixir/Node/k6); mise dropped.
+
+Problems found and fixed in the staged files:
+1. Home volume shadowing: anything the image puts under /home/node is
+   hidden by the pre-existing claude_node_home volume. Toolchains moved to
+   /opt, shell wiring to /etc/bash.bashrc + /etc/profile.d +
+   /etc/claude-sandbox/toolchain.sh, bash history to $HOME.
+2. /tmp is noexec; ruby-build/rustup execute from TMPDIR. TMPDIR now
+   /home/node/tmp (compose env), created by /etc/bash.bashrc.
+3. asdf shims weren't on PATH. toolchain.sh prepends /opt/asdf/shims and
+   exports ASDF_<TOOL>_VERSION for each baked tool.
+Also: lowercase proxy vars + NO_PROXY added; the "Flaw B note" comment
+fixed; /commandhistory removed.
+
+Staged (re-pull all): claude-code/Dockerfile, claude-code/docker-compose.yml.template,
+claude-code/.env.claude.example, proxy/squid.conf, README.md,
+docker-compose.claude.yml (replaces .keep), .env.claude (placeholders),
+SESSION-PROGRESS.md.
+
+Not verifiable from inside the sandbox -- check on first build:
+- asdf release tag `v0.18.0` exists and ships `asdf-v0.18.0-linux-amd64.tar.gz`
+  containing a single `asdf` binary (else adjust ASDF_VERSION).
+- `rvm-installer.asc` exists at the 1.29.12 tag path and verifies.
+- `rvm-installer --path /opt/rvm --ignore-dotfiles --version 1.29.12` flags
+  are accepted; `rvm autolibs disable` then `rvm install` does not try sudo.
+- asdf-erlang builds OTP 28.5 with the KERL_CONFIGURE_OPTIONS given
+  (drop `--without-megaco` if configure rejects it).
+- asdf-elixir accepts `1.18.4-otp-28`; `mix local.hex`/`local.rebar` land
+  in /opt/mix and `mix deps.get` at runtime does not try to write /opt/mix.
+- `MIX_BUILD_ROOT` is honoured by Elixir 1.18 (else use MIX_BUILD_PATH).
+- `rvm alias create default` yields /opt/rvm/wrappers/default on PATH.
+- Bundler actually fetches .gem files from rubygems.org (not another
+  CDN host) -- watch squid's log on the first `bundle install`.
+Then the README verification checklist, which now has toolchain items.

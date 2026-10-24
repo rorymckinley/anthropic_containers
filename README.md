@@ -1,7 +1,8 @@
 # Claude Code sandbox template
 
 Shared base for running Claude Code in an isolated container per project:
-Node/Ruby/Rust/Elixir tooling (RVM, asdf, mise) plus an ephemeral Postgres
+the project's Ruby/Erlang/Elixir/Node toolchain baked into the image at
+build time (RVM for Ruby, asdf for the rest), plus an ephemeral Postgres
 sibling, on an `internal` Docker network whose only way out is a squid
 proxy with a destination allowlist, non-root, `cap_drop: ALL`, `read_only`
 root fs.
@@ -177,18 +178,24 @@ Docker-assigned; nothing addresses anything on it by IP.
    `docker-compose.claude.yml`, and copy `claude-code/.env.claude.example`
    as `.env.claude` next to it.
 2. Find-and-replace `_change_me` / `change-me` throughout: service/container
-   names and the host repo path in the code mount.
+   names, the image name, and the host repo path in the code mount.
 3. Fill in `.env.claude`: `PROJECT_NET_OCTET` (must be unique among
    projects running at the same time -- start at 0 and increment per
-   additional project), Postgres credentials/version, the path to your
-   personal CLAUDE.md, and `CLAUDE_MANAGED_DIR`. Never commit this file.
+   additional project), `SANDBOX_REPO` (host path to this repo -- the
+   claude image is built from its `claude-code/` directory), the toolchain
+   versions (see "Toolchains"; match the project's `.tool-versions` /
+   `.ruby-version` exactly), Postgres credentials/version, the path to
+   your personal CLAUDE.md, and `CLAUDE_MANAGED_DIR`. Never commit this
+   file.
 4. Once per machine: copy `claude-code/managed/` from this repo to the
    directory named by `CLAUDE_MANAGED_DIR` (every project can point at the
    same one). See "Managed settings" below for what's in it.
 5. Add the SELinux file-context rule for this repo, using this project's
    `PROJECT_NET_OCTET` -- the `semanage`/`restorecon` pair under "SELinux"
    above. Without it the container can't read the code mount at all.
-6. `docker compose --env-file .env.claude -f docker-compose.claude.yml up -d`
+6. `docker compose --env-file .env.claude -f docker-compose.claude.yml up -d --build`.
+   The first build compiles Erlang if a version is set; budget 10-20
+   minutes for that layer. Later builds reuse it until the version changes.
 
 ## Outbox: pull model, not push
 
@@ -278,24 +285,98 @@ ports -- reachable only from the claude container over the internal
 `anthropic.com`/`claude.ai`, so service-name resolution doesn't work here
 -- address Postgres by its static `ipv4_address`, matched to `PGHOST`).
 
-## Updating Claude Code
+## Toolchains
 
-There's no self-update inside the container, deliberately. The Dockerfile's
-`npm install -g @anthropic-ai/claude-code` floats to latest at *build*
-time, so to pick up a newer version: rebuild the image and recreate the
-container (`docker compose --env-file .env.claude -f
-docker-compose.claude.yml up -d --build`).
+Language runtimes are **built into the image**, one set per project, from
+the versions in that project's `.env.claude` (`RUBY_VERSIONS`,
+`ERLANG_VERSION`, `ELIXIR_VERSION`, `NODEJS_VERSION`, `K6_VERSION`; empty
+means not installed). The compose file passes them as build args to this
+repo's `claude-code/Dockerfile`. Base layers are shared between projects
+through the build cache; only the toolchain layers differ.
 
-Letting Claude Code update itself at runtime would mean opening egress to
-npm's registry (`registry.npmjs.org`) -- a DNS allowlist addition, and
-dropping the pinned-IP leg of the proxy ACL for that destination, since
-the registry is CDN-backed with rotating IPs -- plus a writable volume
-over `/usr/local/share/npm-global`, which is currently baked read-only
-into the image layer. That's a materially bigger, harder-to-reason-about
-trust boundary than the three Anthropic hostnames at one pinned IP this
-setup allows today, for a problem that a rebuild already solves. Same
-philosophy as the native build deps: the fix path is
-edit-Dockerfile/rebuild, not live-patch.
+Why in the image rather than installed at runtime:
+
+- **Immutable.** The root fs is `read_only`, so a session can't alter a
+  ruby, an OTP install or an asdf shim. Before this, those lived in
+  writable volumes and were the main "one bad session persists into the
+  next" path left after the managed-settings tier closed hooks and MCP.
+- **Less egress.** Runtimes come from ruby-lang.org, nodejs.org and
+  GitHub, all fetched at *build* time on the host, where the network is
+  open. The sandbox itself only needs the package registries (see "The
+  proxy"). GitHub in particular stays closed at runtime.
+- **Pinned.** Versions are explicit build args, the RVM installer is
+  GPG-verified from a tagged release, asdf and git-delta are pinned (with
+  optional SHA256 args), and the asdf plugins can be pinned to commits.
+
+Where things are, and what that means at runtime:
+
+| What | Where | Writable at runtime? |
+|---|---|---|
+| RVM, rubies, default gems | `/opt/rvm` | No -- use Bundler, see below |
+| asdf plugins, installs, shims | `/opt/asdf` | No -- shims are generated at build |
+| Hex + rebar3 archives | `/opt/mix` (`MIX_HOME`) | No -- `mix local.*` won't work, isn't needed |
+| Shell wiring | `/etc/bash.bashrc`, `/etc/profile.d/`, `/etc/claude-sandbox/toolchain.sh` | No |
+| Bundler gems (`BUNDLE_PATH`) | `/home/node/.bundle-path` | Yes (home volume) |
+| Mix deps and build (`MIX_DEPS_PATH`, `MIX_BUILD_ROOT`) | `/home/node/mix/` | Yes |
+| Hex cache, npm cache, bash history, `TMPDIR` | `/home/node/...` | Yes |
+
+Nothing the image needs at runtime is placed under `/home/node`. Docker
+seeds a named volume from image content only when the volume is *empty*
+on first attach; a home volume that already exists keeps its old
+contents and silently hides anything a new image put there. That is why
+the toolchains are in `/opt`, the wiring is in `/etc`, and bash history
+is in the home volume rather than the image's `/commandhistory`.
+
+Tool versions are selected the asdf way -- `.tool-versions` in the
+project, or the `ASDF_<TOOL>_VERSION` exports in `toolchain.sh` as the
+default when no file is in scope. Only the baked versions exist, so a
+project's `.tool-versions` must name exactly those. The base image's
+node 22 stays underneath (it runs `claude` itself); interactive shells
+see the asdf node first via the shims.
+
+**Working with the read-only code mount.** Dependency installs write into
+the project tree (`Gemfile.lock`, `deps/`, `_build/`, `node_modules/`),
+which is `:ro` here. The workflow is: change the dependency on the host,
+run the install there so the lockfile is updated and committed, then run
+the same install inside the sandbox, where the compose environment
+redirects the writable parts onto the home volume:
+
+- Ruby: `bundle install` with `BUNDLE_PATH` on the home volume and
+  `BUNDLE_FROZEN=true`, so an out-of-date lockfile is a clear error
+  rather than an `EROFS`. Ad hoc `gem install` into the ruby won't work;
+  anything wanted globally goes in the Dockerfile. If a project's own
+  `.bundle/config` sets a vendored path, set `BUNDLE_APP_CONFIG` to a
+  home-volume directory too -- local config outranks environment.
+- Elixir: `mix deps.get` and `mix compile` use `MIX_DEPS_PATH` and
+  `MIX_BUILD_ROOT` on the home volume. Hex and rebar3 are pre-installed.
+- Node: there is no supported way to relocate `node_modules`. Run
+  `npm install` on the host and use the resulting tree read-only. Native
+  addons compiled on the host may not load in the container (different
+  distro); rebuild those into the image if it matters.
+- Anything else that writes into the tree at runtime (Rails `tmp/` and
+  `log/`, `coverage/`, `dist/`) needs its own redirect or a read-write
+  code mount for that project.
+
+`/tmp` is a `noexec` tmpfs (Docker's default, kept). Builds that compile
+and execute in their temp dir -- ruby-build, rustup -- fail there, so
+`TMPDIR` points at `/home/node/tmp` instead; `/etc/bash.bashrc` creates it.
+
+## Updating Claude Code or a toolchain version
+
+There's no self-update inside the container, deliberately. The image
+installs Claude Code at *build* time (`CLAUDE_CODE_VERSION` in
+`.env.claude`, `latest` by default) into a directory that is read-only at
+runtime. To pick up a newer version, or to change any language version:
+edit `.env.claude`, then rebuild and recreate (`docker compose --env-file
+.env.claude -f docker-compose.claude.yml up -d --build`). That ends the
+running session, so do it between sessions.
+
+`registry.npmjs.org` is now reachable through the proxy for project
+dependencies, so the network is no longer what prevents a runtime
+self-update; the read-only install directory is. Keep it that way: the
+fix path for a stale Claude Code, a missing header, or a new language
+version is the same -- edit, rebuild, recreate -- and the image stays the
+single description of what's in the sandbox.
 
 ## The proxy
 
@@ -311,6 +392,25 @@ control; the IP leg guards against a listed name being pointed elsewhere.
 Both fail closed. The pinned IP alone would be wider than it looks --
 Anthropic fronts `claude.ai`, `www.anthropic.com` and others at the same
 address -- which is why the hostname leg exists.
+
+A second ACL, `registry_hosts`, allows CONNECT by hostname only to
+`index.rubygems.org`, `rubygems.org`, `repo.hex.pm` and
+`registry.npmjs.org`, so `bundle install`, `mix deps.get` and `npm
+install` work inside the sandbox. These are CDN-fronted, so there is no
+IP leg. The runtimes themselves are baked into the image (see
+"Toolchains"), so ruby-lang.org, nodejs.org and github.com are *not*
+allowed at runtime. Be clear about what this opens: squid can't see the
+method or path inside the tunnel, so `rubygems.org` and
+`registry.npmjs.org` are reachable for `gem push` and `npm publish` as
+well as for downloads, and keeping your own publish tokens out of the
+sandbox does not change that -- a prompt-injected session can bring an
+attacker's token. It is the same residual-risk class as the Anthropic API
+itself (see "Residual risk"). `index.rubygems.org` and `repo.hex.pm` are
+download-only hosts. `github.com` is deliberately absent: `git push`
+would make it a general-purpose write channel. The first time you install
+a project's dependencies, watch `docker logs squid-proxy-<project>` --
+every denied CONNECT names the host a tool actually tried, which is how
+to extend the list from evidence rather than guesswork.
 
 squid runs as uid 1000 on a read-only root fs with `cap_drop: ALL`, so
 the config pins every path squid might write (access log, cache log, pid
@@ -369,10 +469,13 @@ administrators. Two files live there, both from `claude-code/managed/`:
 What this does and doesn't cover:
 
 - Covered: hook and MCP persistence, the two no-prompt execution paths.
-- Not covered: `~/.bashrc` and the shims in the RVM/asdf/mise volumes are
-  still writable and still run when *you* open a shell or when Claude runs
-  a tool through them. That's the ordinary "compromised dev environment"
-  risk, contained to this project's sandbox; it doesn't reach the host.
+- Not covered: `~/.bashrc` on the home volume is still writable and bash
+  reads it after `/etc/bash.bashrc`, so a session can plant a PATH
+  override or an alias that runs when *you* next open a shell there. The
+  toolchain itself (rubies, shims, Hex) is read-only in the image and no
+  longer a persistence target. That's the ordinary "compromised dev
+  environment" risk, contained to this project's sandbox; it doesn't
+  reach the host.
 - Also covered: permission rules. `allowManagedPermissionRulesOnly: true`
   makes the managed file the *only* source of `allow`/`ask`/`deny` rules.
   Without it, a compromised session could write `"allow": ["Bash(*)"]`
@@ -400,12 +503,19 @@ restart.
 
 - The outbox is the deliberate, reviewed exfiltration path -- its value is
   that nothing leaves without your `docker cp`, not that it's leak-proof.
-- Per-tool volumes (home/RVM/asdf/mise) persist across recreates of that
-  *project's* container only -- no cross-project sharing, but a
-  compromised session could still plant something in `.bashrc` or a
-  shim that survives to the next session of the same project. Hooks and
-  MCP servers, the two no-prompt vectors, are closed by the managed
-  settings tier above.
+- The home volume persists across recreates of that *project's*
+  container only -- no cross-project sharing, but a compromised session
+  could still plant something in `.bashrc`, a Bundler-installed gem under
+  `BUNDLE_PATH`, or a Mix dep under `MIX_DEPS_PATH` that survives to the
+  next session of the same project. The runtimes and shims themselves are
+  read-only in the image. Hooks and MCP servers, the two no-prompt
+  vectors, are closed by the managed settings tier above.
+- The package registries are allowed by hostname and some of them accept
+  publishes on the same name (`rubygems.org`, `registry.npmjs.org`).
+  Without your credentials in the sandbox those can't touch *your*
+  packages, but an attacker's token in a prompt injection makes them an
+  exfiltration path, like the API one above. `index.rubygems.org` and
+  `repo.hex.pm` are download-only; `github.com` is not allowed.
 - claude.ai connectors are an egress path the network layer can't see.
   Gmail drafts, Drive uploads and the like go from Claude Code to
   Anthropic over the sanctioned proxy path and from Anthropic to Google --
@@ -473,7 +583,16 @@ restart.
 
       ```bash
       curl -m 10 -o /dev/null -w '%{http_code}\n' https://api.anthropic.com/   # any 4xx = proxied path works
+      curl -m 10 -o /dev/null -w '%{http_code}\n' https://index.rubygems.org/   # registry allowed by hostname
+      curl -m 10 -o /dev/null -w '%{http_code}\n' https://repo.hex.pm/           # same
       psql -c 'select 1'                                                        # Postgres on-subnet
+      ```
+
+      while these must get a 403 from squid (CONNECT refused):
+
+      ```bash
+      curl -m 10 -I https://github.com/            # no GitHub at runtime
+      curl -m 10 -I https://cache.ruby-lang.org/   # runtimes come from the image, not the network
       ```
 
       `ip route` should show only the `172.100.X.0/24` line and no
@@ -540,5 +659,29 @@ restart.
       (backing it up first), repeat the request, expect the same refusal,
       then restore the backup.
 - [ ] Postgres version is actually controlled by `POSTGRES_VERSION`.
+- [ ] The baked toolchain is present and immutable. Inside the container
+      (interactive shell, so `toolchain.sh` has been sourced):
+      `erl -noshell -eval 'io:format("~s~n",[erlang:system_info(otp_release)]),halt().'`,
+      `elixir --version`, `node --version`, `k6 version` and, if set,
+      `ruby --version` all report the versions from `.env.claude`;
+      `touch /opt/asdf/x /opt/rvm/x` fails with "Read-only file system";
+      `cat /etc/claude-sandbox/toolchain.sh` lists one `ASDF_*_VERSION`
+      export per installed tool. Also `docker exec <container> node
+      --version` from the host reports the base image's node 22, not the
+      asdf one (that path doesn't read bashrc, by design).
+- [ ] Nothing the image needs is hidden by the home volume: with the
+      container running, `docker run --rm <image> ls /home/node` shows no
+      `.rvm`, `.asdf` or `.local/bin` -- everything is in `/opt` and `/etc`.
+- [ ] `TMPDIR` is exec-capable: inside the container
+      `printf '#!/bin/sh\necho ok\n' > "$TMPDIR/t" && chmod +x "$TMPDIR/t" && "$TMPDIR/t"`
+      prints `ok`, while the same against `/tmp/t` fails with "Permission
+      denied".
+- [ ] Dependencies install from the sandbox against the `:ro` tree. In an
+      Elixir project directory: `mix deps.get && mix compile` succeeds and
+      writes under `/home/node/mix/`, nothing under `/workspace/code`
+      changes (`git status` on the host is clean). In a Ruby project:
+      `bundle install` succeeds into `/home/node/.bundle-path`; with a
+      deliberately stale `Gemfile.lock` on the host it fails with a
+      "frozen" message, not `EROFS`.
 - [ ] Both the project `CLAUDE.md` and the personal `CLAUDE.md` take
       effect simultaneously (merge confirmed).

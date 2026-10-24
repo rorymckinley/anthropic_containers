@@ -38,7 +38,22 @@ services:
       egress: {}
 
   claude_code_change_me:
-    image: claude-code-rory
+    # Built per project from the template repo's Dockerfile. The base
+    # layers are shared between projects via the build cache; only the
+    # toolchain layers (versions below) differ. Rebuild with
+    # `up -d --build` after changing any of these or to pick up a newer
+    # Claude Code. Empty version = that language isn't installed.
+    build:
+      context: ${SANDBOX_REPO}/claude-code
+      args:
+        TZ: ${TZ:-UTC}
+        RUBY_VERSIONS: ${RUBY_VERSIONS:-}
+        ERLANG_VERSION: ${ERLANG_VERSION:-}
+        ELIXIR_VERSION: ${ELIXIR_VERSION:-}
+        NODEJS_VERSION: ${NODEJS_VERSION:-}
+        K6_VERSION: ${K6_VERSION:-}
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+    image: claude-sandbox-change-me
     container_name: claude-code-change-me
     entrypoint: /bin/bash
     stdin_open: true
@@ -50,8 +65,26 @@ services:
     environment:
       DISABLE_ERROR_REPORTING: "1"
       DISABLE_TELEMETRY: "1"
+      # Both cases: curl/git/bundler read the lowercase ones, Node and
+      # Erlang's httpc read uppercase. Postgres is on-subnet, not via squid.
       HTTP_PROXY: http://172.100.${PROJECT_NET_OCTET}.80:3128
       HTTPS_PROXY: http://172.100.${PROJECT_NET_OCTET}.80:3128
+      http_proxy: http://172.100.${PROJECT_NET_OCTET}.80:3128
+      https_proxy: http://172.100.${PROJECT_NET_OCTET}.80:3128
+      NO_PROXY: localhost,127.0.0.1,172.100.${PROJECT_NET_OCTET}.201
+      no_proxy: localhost,127.0.0.1,172.100.${PROJECT_NET_OCTET}.201
+      # /tmp is a noexec tmpfs (Docker default, kept on purpose). Anything
+      # that builds-and-runs in its temp dir (ruby-build, rustup) needs an
+      # exec-capable one; the home volume is. /etc/bash.bashrc creates it.
+      TMPDIR: /home/node/tmp
+      # The toolchain is read_only in the image, so per-project packages go
+      # on the home volume. BUNDLE_FROZEN turns "Gemfile.lock needs
+      # updating" into a clear error instead of an EROFS on the :ro code
+      # mount -- run `bundle install` on the host first, then here.
+      BUNDLE_PATH: /home/node/.bundle-path
+      BUNDLE_FROZEN: "true"
+      MIX_DEPS_PATH: /home/node/mix/deps
+      MIX_BUILD_ROOT: /home/node/mix/_build
       PGHOST: 172.100.${PROJECT_NET_OCTET}.201
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER}
@@ -70,14 +103,15 @@ services:
       # ~/.claude.json are ignored. Directory mount, not file mounts, so
       # host-side edits (even rename-saving editors) are seen immediately.
       - ${CLAUDE_MANAGED_DIR}:/etc/claude-code:ro
+      # The only persistent writable state. Note Docker seeds a named
+      # volume from image content only when the volume is empty, so
+      # nothing the image needs at runtime lives under /home/node (the
+      # Dockerfile puts toolchains in /opt and shell wiring in /etc).
       - claude_node_home:/home/node
-      - claude_rvm:/home/node/.rvm
-      - claude_asdf:/home/node/.asdf
-      - claude_mise:/home/node/.local/share/mise
       # Outbox: pull model only. Claude writes here, Rory reviews inside
       # the container, then `docker cp`s out whatever he wants to keep.
       # Must be a volume, not tmpfs -- `docker cp` can't read tmpfs (see
-      # README's Flaw B note).
+      # README, "Outbox: pull model, not push").
       - claude_outbox:/workspace/outbox
     cap_drop:
       - ALL
@@ -125,9 +159,6 @@ services:
 
 volumes:
   claude_node_home:
-  claude_rvm:
-  claude_asdf:
-  claude_mise:
   claude_outbox:
 
 networks:

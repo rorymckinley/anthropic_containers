@@ -243,11 +243,13 @@ RUN if [ -n "$NODEJS_VERSION" ]; then \
     fi
 
 # k6 via asdf-k6 (prebuilt from GitHub releases).
-ARG ASDF_K6_PLUGIN_REF=master
+# Empty ref = stay on the branch `asdf plugin add` cloned: this repo has no
+# `master` branch, so naming one fails the build.
+ARG ASDF_K6_PLUGIN_REF=""
 ARG K6_VERSION=""
 RUN if [ -n "$K6_VERSION" ]; then \
       asdf plugin add k6 https://github.com/grimoh/asdf-k6.git && \
-      git -C "$ASDF_DATA_DIR/plugins/k6" checkout -q "$ASDF_K6_PLUGIN_REF" && \
+      { [ -z "$ASDF_K6_PLUGIN_REF" ] || git -C "$ASDF_DATA_DIR/plugins/k6" checkout -q "$ASDF_K6_PLUGIN_REF"; } && \
       asdf install k6 "$K6_VERSION" && \
       echo "export ASDF_K6_VERSION=${K6_VERSION}" >> /etc/claude-sandbox/toolchain.sh && \
       rm -rf "$ASDF_DATA_DIR/downloads"; \

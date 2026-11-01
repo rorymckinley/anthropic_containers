@@ -136,6 +136,9 @@ ENV SHELL=/bin/bash
 RUN cat <<'TC' > /etc/claude-sandbox/toolchain.sh
 # Generated at image build. Sourced by /etc/bash.bashrc and /etc/profile.d.
 export PATH="/opt/asdf/shims:$PATH"
+# The wrappers on the image's PATH are for non-interactive `docker exec`. RVM                          
+# must not see them when it loads, or it warns and skips the default env.
+PATH=$(printf '%s' "$PATH" | sed 's#/opt/rvm/wrappers/default:##g')
 [ -s /opt/rvm/scripts/rvm ] && source /opt/rvm/scripts/rvm
 TC
 
@@ -156,6 +159,12 @@ RUN gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys \
   bash /tmp/rvm-installer --version "${RVM_VERSION}" --path /opt/rvm --ignore-dotfiles && \
   rm -f /tmp/rvm-installer /tmp/rvm-installer.asc && \
   source /opt/rvm/scripts/rvm && rvm autolibs disable
+# Gemsets can't be created at runtime because /opt/rvm is read_only. They also
+# add nothing here: gems go to BUNDLE_PATH on the per-project home volume.
+# RVM reloads this file, so the flag survives its internal variable resets.
+USER root
+RUN echo 'rvm_ignore_gemsets_flag=1' > /etc/rvmrc
+USER node
 
 # ---- Per-project toolchain (build args from the project's .env.claude) ---
 # Every ARG below defaults to empty = "don't install". Each step is a

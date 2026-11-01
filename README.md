@@ -68,6 +68,73 @@ Be precise about what this fixes, because it's easy to over-read:
 If a file is missing inside the container: `ls -Z <file>` on the host.
 If it isn't `container_file_t`, `restorecon` it.
 
+### SELinux: the Claude settings directories (once per host)
+
+Two more host paths are mounted into every sandbox: `CLAUDE_MANAGED_DIR`
+and the directory holding `PERSONAL_CLAUDE_MD_PATH`. Anything under your
+home directory is `user_home_t` by default, which a container can't read,
+so these need a rule too. The `:ro` on the mount doesn't help, and neither
+does the rule on the repo.
+
+```bash
+MANAGED_DIR=/absolute/path                # CLAUDE_MANAGED_DIR from .env.claude
+PERSONAL_DIR=/absolute/path               # the directory holding PERSONAL_CLAUDE_MD_PATH
+
+mkdir -p "$MANAGED_DIR" "$PERSONAL_DIR"
+cp -n claude-code/managed/* "$MANAGED_DIR"/
+touch "$PERSONAL_DIR/CLAUDE.md"           # must be a file before the first `up`
+
+for DIR in "$MANAGED_DIR" "$PERSONAL_DIR"; do
+  sudo semanage fcontext -a -t container_ro_file_t "${DIR}(/.*)?"
+  sudo restorecon -R -F -v "$DIR"
+done
+```
+
+**Without this rule the sandbox fails open.** Claude Code starts normally
+when it can't read `/etc/claude-code`, and none of the managed policy
+applies: planted hooks and MCP servers run, claude.ai connectors load, and
+the `Artifact` tool is available. Nothing looks broken, so check it with
+the verification checklist below.
+
+Why this rule differs from the repo's:
+
+- **No per-project level.** These directories are shared between projects,
+  so they can't carry one project's `s0:c<N>,c1000`. At plain `s0`, any
+  container that mounts them can read them, so keep credentials out of
+  your personal CLAUDE.md. A container can only reach them if they're
+  mounted into it.
+- **`container_ro_file_t`, not `container_file_t`.** Containers can read
+  this type but not write it, so the policy files stay protected at the
+  SELinux layer even if a mount ever loses its `:ro`. Host editors are
+  unaffected.
+- **The rule covers the directory, not just the file.** A rename-saving
+  editor creates a new file, which inherits its type from the directory.
+  That's why each path must be a directory of its own: never `~`, or
+  `~/.claude`, which holds your host credentials.
+
+A file *moved* in from elsewhere keeps its old type, so run
+`sudo restorecon -v <file>` on it. Label changes apply at once, with no
+container restart. `PERSONAL_CLAUDE_MD_PATH` is a single-file mount, so
+after a rename-save the container keeps seeing the old file until it's
+recreated.
+
+**If `CLAUDE.md` turned up as a root-owned directory:** Docker creates
+missing bind sources as empty directories, and older copies of the compose
+file allowed that. The current one refuses to start instead. Cleaning up
+takes both of the `rmdir`s below, because the container start also left an
+empty directory inside the home volume, and a file can't be mounted over
+it. `down` ends any running session. Don't add `-v`: that deletes the home
+volume, including your Claude login.
+
+```bash
+docker compose --env-file .env.claude -f docker-compose.claude.yml down
+sudo rmdir "$PERSONAL_CLAUDE_MD_PATH"
+touch "$PERSONAL_CLAUDE_MD_PATH"          # or copy your real CLAUDE.md here
+sudo restorecon -F -v "$PERSONAL_CLAUDE_MD_PATH"
+docker run --rm -v <compose project>_claude_node_home:/h alpine rmdir /h/.claude/CLAUDE.md
+docker compose --env-file .env.claude -f docker-compose.claude.yml up -d
+```
+
 ## Networking
 
 Each project gets two networks of its own, not shared with any other
@@ -187,9 +254,11 @@ Docker-assigned; nothing addresses anything on it by IP.
    `.ruby-version` exactly), Postgres credentials/version, the path to
    your personal CLAUDE.md, and `CLAUDE_MANAGED_DIR`. Never commit this
    file.
-4. Once per machine: copy `claude-code/managed/` from this repo to the
-   directory named by `CLAUDE_MANAGED_DIR` (every project can point at the
-   same one). See "Managed settings" below for what's in it.
+4. Once per machine: follow "SELinux: the Claude settings directories"
+   above. It copies `claude-code/managed/` to the directory named by
+   `CLAUDE_MANAGED_DIR` (every project can point at the same one), creates
+   your personal CLAUDE.md if needed, and labels both. See "Managed
+   settings" below for what's in the policy.
 5. Add the SELinux file-context rule for this repo, using this project's
    `PROJECT_NET_OCTET` -- the `semanage`/`restorecon` pair under "SELinux"
    above. Without it the container can't read the code mount at all.
@@ -493,6 +562,10 @@ What this does and doesn't cover:
   default, since running the sandbox in bypass mode is a legitimate way
   to use it.
 
+These protections depend on the container being able to read the files,
+and Claude Code doesn't fail if it can't -- see "SELinux: the Claude
+settings directories".
+
 To change the policy: edit the files in `CLAUDE_MANAGED_DIR` on the host.
 It's a directory mount, so the container sees the edit immediately
 regardless of how your editor saves, and Claude Code reloads managed
@@ -609,7 +682,19 @@ restart.
       lists exactly one network).
 - [ ] Managed settings are mounted and read-only: inside the container,
       `cat /etc/claude-code/managed-settings.json` shows the policy and
-      `touch /etc/claude-code/x` fails with "Read-only file system".
+      `touch /etc/claude-code/x` fails with "Read-only file system". On the
+      host, `ls -Z "$CLAUDE_MANAGED_DIR"` shows `container_ro_file_t:s0`.
+- [ ] The policy is in force, not just readable. In a session started after
+      the label was fixed, `/mcp` lists no claude.ai connectors and the
+      `Artifact` tool isn't available.
+- [ ] Personal CLAUDE.md is a readable file: inside the container,
+      `test -f ~/.claude/CLAUDE.md && cat ~/.claude/CLAUDE.md` shows its
+      contents. "Is a directory" or "Permission denied" means the host path
+      or label is wrong.
+- [ ] A missing settings path stops the stack instead of being created:
+      with `PERSONAL_CLAUDE_MD_PATH` pointed at a path that doesn't exist,
+      `up` fails with a "bind source path does not exist" error and nothing
+      appears at that path.
 - [ ] A hook planted in user settings does not run. Inside the container,
       with `~/.claude/settings.json` backed up first:
 

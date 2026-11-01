@@ -155,3 +155,53 @@ Not verifiable from inside the sandbox -- check on first build:
 - Bundler actually fetches .gem files from rubygems.org (not another
   CDN host) -- watch squid's log on the first `bundle install`.
 Then the README verification checklist, which now has toolchain items.
+
+## Update 2026-10-31 -- Claude settings unavailable in the recreated container
+
+Container now runs the new compose file. Inspected from inside it:
+- `/etc/claude-code`: `user_home_t:s0`, reads denied. The managed policy is NOT
+  in force: the Artifact tool and a claude.ai connector both loaded.
+- `~/.claude/CLAUDE.md`: empty root-owned directory created by Docker at 14:43
+  because the host file didn't exist, also `user_home_t`. Needs both a real file
+  and a label, plus removing the stub directory in the home volume.
+- `~/.claude/settings.json` and `~/.claude.json` checked: no planted hooks or
+  MCP servers.
+
+Staged (pull these only; the staged `.env.claude` is stale placeholders, do not
+pull it over the real one): README.md, docker-compose.claude.yml,
+claude-code/docker-compose.yml.template, claude-code/.env.claude.example,
+SESSION-PROGRESS.md. Rule is `container_ro_file_t` on both directories; compose
+uses long-form binds with `create_host_path: false`.
+
+Not testable from inside the sandbox (no docker, sudo or semanage): the
+semanage rule, long-form compose behaviour, the volume stub removal. After the
+host steps, re-check with the README verification checklist.
+
+Open, not fixed: `/workspace/outbox` is root:root 755, so uid 1000 can't write
+it and the documented outbox workflow doesn't work. The Dockerfile creates
+/workspace but not /workspace/outbox, so the volume comes up root-owned. Staging
+is still in ~/outbox-staging because of this.
+
+## Update 2026-11-01 -- Ruby sandbox fixes from debugging plentify
+
+Already in the repo's working tree, applied by Rory: RVM wrappers stripped from
+PATH in toolchain.sh, `rvm_ignore_gemsets_flag=1` in /etc/rvmrc.
+
+Staged on top of those: BUNDLE_USER_CONFIG baked config (RVM unsets BUNDLE_PATH,
+`scripts/functions/selector:187`), /workspace/outbox created in the image (fixes
+the open item above), PGDG Postgres client following POSTGRES_VERSION, the
+matching compose build arg, and README updates.
+
+Pull: claude-code/Dockerfile, claude-code/docker-compose.yml.template,
+docker-compose.claude.yml, claude-code/.env.claude.example, README.md,
+SESSION-PROGRESS.md. The staged .env.claude is still stale; do not pull it. The
+two compose files and .env.claude.example also carry the 2026-10-31 long-form
+bind changes, which the repo doesn't have yet.
+
+Other projects' compose copies, including plentify's, need the
+`POSTGRES_VERSION: ${POSTGRES_VERSION}` build arg added by hand.
+
+Not built or run: no docker or real Ruby in this sandbox. The gemset and PATH
+behaviour was tested on a stub-ruby copy of RVM. BUNDLE_USER_CONFIG comes from
+reading Bundler 2.5.22; plentify runs 4.0.17. First-build checks are in the README
+verification checklist.

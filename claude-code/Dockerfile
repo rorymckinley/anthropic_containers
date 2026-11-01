@@ -64,17 +64,29 @@ RUN apt-get update && apt-get install -y \
   libxslt1-dev \
   && rm -rf /var/lib/apt/lists/*
 
+# Postgres client matching the sibling server, from PGDG. Debian's client is
+# 15, and pg_dump refuses to dump a newer server, so `rake db:migrate` would
+# apply migrations and then fail at the schema dump. pg_wrapper runs the newest
+# installed client for a remote host. Takes "16" or "16.15"; only the major is used.
+ARG POSTGRES_VERSION=16
+RUN install -d /usr/share/postgresql-common/pgdg && \
+  curl -fsSLo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc && \
+  echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+  apt-get update && apt-get install -y "postgresql-client-${POSTGRES_VERSION%%.*}" && \
+  rm -rf /var/lib/apt/lists/*
+
 # Ensure default node user has access to /usr/local/share
 RUN mkdir -p /usr/local/share/npm-global && \
   chown -R node:node /usr/local/share
 
 # Toolchain prefixes, outside /home/node (see header). Owned by node so the
 # unprivileged build steps below can populate them; read_only at runtime
-# makes ownership irrelevant for tamper-resistance.
+# makes ownership irrelevant for tamper-resistance. /workspace/outbox must exist
+# here, owned by node: a new named volume takes its ownership from this directory.
 ENV rvm_path=/opt/rvm \
     ASDF_DATA_DIR=/opt/asdf \
     MIX_HOME=/opt/mix
-RUN mkdir -p /opt/rvm /opt/asdf /opt/mix /etc/claude-sandbox /workspace /home/node/.claude && \
+RUN mkdir -p /opt/rvm /opt/asdf /opt/mix /etc/claude-sandbox /workspace/outbox /home/node/.claude && \
   chown node:node /opt/rvm /opt/asdf /opt/mix /etc/claude-sandbox && \
   chown -R node:node /workspace /home/node/.claude
 
@@ -243,6 +255,12 @@ RUN if [ -n "$K6_VERSION" ]; then \
 
 # Shims are generated at build; nothing can add one at runtime.
 RUN asdf reshim 2>/dev/null || true
+
+# RVM unsets BUNDLE_PATH on every `rvm use`, including its cd hook, so setting
+# it in compose isn't enough. This global config is in the read_only image and
+# replaces ~/.bundle/config entirely. A project's .bundle/config still outranks it.
+ENV BUNDLE_USER_CONFIG=/etc/claude-sandbox/bundle-config
+RUN printf -- '---\nBUNDLE_PATH: "/home/node/.bundle-path"\n' > /etc/claude-sandbox/bundle-config
 
 # ---- Claude Code -----------------------------------------------------------
 # Explicit /usr/local/bin/npm = the base image's node 22, regardless of

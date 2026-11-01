@@ -52,6 +52,7 @@ services:
         ELIXIR_VERSION: ${ELIXIR_VERSION:-}
         NODEJS_VERSION: ${NODEJS_VERSION:-}
         K6_VERSION: ${K6_VERSION:-}
+        POSTGRES_VERSION: ${POSTGRES_VERSION}
         CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
     image: claude-sandbox-change-me
     container_name: claude-code-change-me
@@ -95,14 +96,30 @@ services:
       # Code mount: plain :ro, no :Z -- see README's one-time host SELinux
       # setup step, which makes :Z's mount-time-only relabel unnecessary.
       - ~/data/git/change-me:/workspace/code:ro
+      # The two Claude settings mounts use the long form so a missing host
+      # path stops `up` with an error. The short form makes Docker create an
+      # empty root-owned directory there instead, and the sandbox then starts
+      # without the settings. Both need the host labels from README,
+      # "SELinux: the Claude settings directories".
+      #
       # Personal, cross-project CLAUDE.md -- host path supplied per machine.
-      - ${PERSONAL_CLAUDE_MD_PATH}:/home/node/.claude/CLAUDE.md:ro
+      - type: bind
+        source: ${PERSONAL_CLAUDE_MD_PATH}
+        target: /home/node/.claude/CLAUDE.md
+        read_only: true
+        bind:
+          create_host_path: false
       # Managed settings tier (managed-settings.json + managed-mcp.json).
       # Read-only, host-controlled, and above everything a session can
       # write: hooks and MCP servers planted in ~/.claude/settings.json or
       # ~/.claude.json are ignored. Directory mount, not file mounts, so
       # host-side edits (even rename-saving editors) are seen immediately.
-      - ${CLAUDE_MANAGED_DIR}:/etc/claude-code:ro
+      - type: bind
+        source: ${CLAUDE_MANAGED_DIR}
+        target: /etc/claude-code
+        read_only: true
+        bind:
+          create_host_path: false
       # The only persistent writable state. Note Docker seeds a named
       # volume from image content only when the volume is empty, so
       # nothing the image needs at runtime lives under /home/node (the

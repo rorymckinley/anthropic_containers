@@ -354,6 +354,10 @@ ports -- reachable only from the claude container over the internal
 `anthropic.com`/`claude.ai`, so service-name resolution doesn't work here
 -- address Postgres by its static `ipv4_address`, matched to `PGHOST`).
 
+The image's Postgres client comes from PGDG and follows the major version of
+`POSTGRES_VERSION`, because `pg_dump` refuses to dump a newer server. Changing
+that major version therefore needs `up -d --build`, not just a recreate.
+
 ## Toolchains
 
 Language runtimes are **built into the image**, one set per project, from
@@ -385,6 +389,7 @@ Where things are, and what that means at runtime:
 | asdf plugins, installs, shims | `/opt/asdf` | No -- shims are generated at build |
 | Hex + rebar3 archives | `/opt/mix` (`MIX_HOME`) | No -- `mix local.*` won't work, isn't needed |
 | Shell wiring | `/etc/bash.bashrc`, `/etc/profile.d/`, `/etc/claude-sandbox/toolchain.sh` | No |
+| RVM and Bundler settings | `/etc/rvmrc`, `/etc/claude-sandbox/bundle-config` | No |
 | Bundler gems (`BUNDLE_PATH`) | `/home/node/.bundle-path` | Yes (home volume) |
 | Mix deps and build (`MIX_DEPS_PATH`, `MIX_BUILD_ROOT`) | `/home/node/mix/` | Yes |
 | Hex cache, npm cache, bash history, `TMPDIR` | `/home/node/...` | Yes |
@@ -416,6 +421,23 @@ redirects the writable parts onto the home volume:
   anything wanted globally goes in the Dockerfile. If a project's own
   `.bundle/config` sets a vendored path, set `BUNDLE_APP_CONFIG` to a
   home-volume directory too -- local config outranks environment.
+  - RVM unsets `BUNDLE_PATH` on every `rvm use`, including when you `cd`
+    into a project, so the path is also set in the image's global Bundler
+    config (`BUNDLE_USER_CONFIG`). `~/.bundle/config` is ignored as a result.
+  - `.ruby-gemset` is ignored (`rvm_ignore_gemsets_flag` in `/etc/rvmrc`),
+    because RVM can't create a gemset under the read-only `/opt/rvm`. The
+    per-project home volume already keeps each project's gems separate.
+  - Gems from sources the proxy blocks, such as GitHub or a private gem server,
+    have to be vendored. On the host, run `BUNDLE_CACHE_ALL=true bundle cache`
+    and add `vendor/cache/` to `.git/info/exclude` unless you commit it. Then
+    run `bundle install --local` in the sandbox, and repeat both steps when the
+    lockfile changes.
+  - Keep gem server credentials out of the project's `.bundle/config`, which
+    the sandbox can read through the code mount. Use
+    `bundle config set --global <host> <user:password>` on the host instead.
+- Rails: `db:migrate` rewrites the schema file in the read-only tree after
+  applying migrations. Send the dump to the outbox with
+  `SCHEMA=/workspace/outbox/structure.sql rake db:migrate` (or `schema.rb`).
 - Elixir: `mix deps.get` and `mix compile` use `MIX_DEPS_PATH` and
   `MIX_BUILD_ROOT` on the home volume. Hex and rebar3 are pre-installed.
 - Node: there is no supported way to relocate `node_modules`. Run
@@ -631,6 +653,10 @@ restart.
       permission denied. Then prove the test is live:
       `docker run --rm --security-opt label=level:s0:c<N>,c1000 -v <repo>:/x:ro alpine cat /x/README.md`
       succeeds.
+- [ ] The outbox is writable: inside the container, `touch /workspace/outbox/x`
+      succeeds. A volume created before the Dockerfile made this directory stays
+      root-owned; check it's empty, then `docker compose down` and
+      `docker volume rm <project>_claude_outbox`.
 - [ ] A file written to the outbox volume comes out cleanly via
       `scripts/outbox.sh <container> pull <file> <dest>`.
 - [ ] The helper refuses a symlink. Inside the container:
@@ -743,7 +769,12 @@ restart.
       `{"permissions":{"allow":["Artifact"]}}` to `~/.claude/settings.json`
       (backing it up first), repeat the request, expect the same refusal,
       then restore the backup.
-- [ ] Postgres version is actually controlled by `POSTGRES_VERSION`.
+- [ ] Postgres version is actually controlled by `POSTGRES_VERSION`, and the
+      client can dump it: inside the container, `pg_dump --schema-only >/dev/null`
+      succeeds and `pg_dump --version` reports the same major version.
+- [ ] Ruby projects load cleanly: a new interactive shell and `cd /workspace/code`
+      print no RVM warning or gemset error. There, `bundle config path` reports
+      `/home/node/.bundle-path` from `/etc/claude-sandbox/bundle-config`.
 - [ ] The baked toolchain is present and immutable. Inside the container
       (interactive shell, so `toolchain.sh` has been sourced):
       `erl -noshell -eval 'io:format("~s~n",[erlang:system_info(otp_release)]),halt().'`,
